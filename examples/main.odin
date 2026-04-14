@@ -15,7 +15,7 @@ foopath :: proc(loc := #caller_location) {
 
 foo :: proc() {
 	span: trace.Span
-	context, span = trace.start("foo")
+	context, span = trace.start() // foo
 	defer trace.end(span)
 
 	bar(77)
@@ -23,6 +23,6 @@ foo :: proc() {
 
 bar :: proc(val: int) {
 	span: trace.Span
-	context, span = trace.start("bar", {{"val", val}})
+	context, span = trace.start(attrs = {{"val", val}})
 	defer trace.end(span)
 }

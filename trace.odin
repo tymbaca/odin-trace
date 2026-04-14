@@ -1,47 +1,78 @@
 #+vet explicit-allocators
 package trace
 
+import "core:thread"
+import "core:sync"
 import "base:runtime"
+import "core:container/queue"
 import "core:encoding/uuid"
 import "core:slice"
 import "core:time"
 
 @(private)
-global_tracer := Tracer{} // noop by default
+global_tracer: ^Tracer // noop by default
 
-init :: proc(
+init_tracer :: proc(
 	tracer: ^Tracer,
 	from_context_proc: proc(ctx: runtime.Context) -> (Span, bool),
 	to_context_proc: proc(ctx: runtime.Context, span: Span) -> runtime.Context,
 	allocator: runtime.Allocator,
 	exporter: Exporter = {},
 ) {
+        context.allocator = allocator
+
 	tracer.from_context_proc = from_context_proc
 	tracer.to_context_proc = to_context_proc
 	tracer.allocator = allocator
 	tracer.exporter = exporter
+        tracer.spans = make(map[uuid.Identifier]Span, allocator)
+        queue.init(&tracer.export_queue, allocator = allocator)
+
 
 	if tracer.exporter != {} {
-		start_exporting(tracer^)
+		start_exporting(tracer)
 	}
 }
 
-destroy :: proc(tracer: Tracer) {
+destroy_tracer :: proc(tracer: ^Tracer) {
+        sync.lock(&tracer.mu)
+        defer sync.unlock(&tracer.mu)
+
+        tracer.state = .Exiting
+
 	if tracer.exporter != {} {
 		stop_exporting(tracer)
 	}
+
+        delete(tracer.spans)
+        queue.destroy(&tracer.export_queue)
+
+        tracer.state = .Destroyed
 }
 
-set_global_tracer :: proc(tracer: Tracer) {
+set_global_tracer :: proc(tracer: ^Tracer) {
 	global_tracer = tracer
 }
 
 Tracer :: struct {
-	set:               bool,
-	from_context_proc: proc(ctx: runtime.Context) -> (Span, bool),
-	to_context_proc:   proc(ctx: runtime.Context, span: Span) -> runtime.Context,
 	allocator:         runtime.Allocator,
 	exporter:          Exporter,
+        exporter_thread:   Maybe(^thread.Thread),
+	from_context_proc: proc(ctx: runtime.Context) -> (Span, bool),
+	to_context_proc:   proc(ctx: runtime.Context, span: Span) -> runtime.Context,
+
+        mu:                sync.Mutex,
+	spans:             map[uuid.Identifier]Span,
+	export_queue:      queue.Queue(Span),
+        export_queue_cond: sync.Auto_Reset_Event,
+
+        state: Tracer_State,
+}
+
+Tracer_State :: enum {
+        Normal,
+        Exiting,
+        Destroyed,
 }
 
 Exporter :: struct {
@@ -54,13 +85,16 @@ Exporter_Error :: enum {
 }
 
 Span :: struct {
-	id:      uuid.Identifier,
-	trace:   uuid.Identifier,
-	parent:  uuid.Identifier, // zero if this is a root span
-	status:  Span_Status,
-	started: time.Time,
-	ended:   time.Time, // zero until span is ended
-	attrs:   [dynamic]Key_Attribute,
+	id:       uuid.Identifier,
+	trace:    uuid.Identifier,
+	parent:   uuid.Identifier, // zero if root span
+	status:   Span_Status,
+
+	started:  time.Time,
+	ended:    time.Time, // zero until span is ended
+
+	attrs:    [dynamic]Key_Attribute,
+	exported: bool,
 }
 
 Key_Attribute :: struct {
@@ -89,9 +123,12 @@ start :: proc(
 	runtime.Context,
 	Span,
 ) {
-	if !tracer.set {
+	if tracer == nil || tracer.state != .Normal {
 		return context, {}
 	}
+
+        sync.lock(&tracer.mu)
+        defer sync.unlock(&tracer.mu)
 
 	name := name
 	if name == "" {
@@ -122,21 +159,35 @@ start :: proc(
 	return ctx, new_span
 }
 
-end :: proc(span: Span, tracer := global_tracer, loc := #caller_location) {
-	if span.id == {} {
+end :: proc(span: Span, tracer := global_tracer) {
+	if tracer == nil || span.id == {} || tracer.state != .Normal {
 		return
 	}
 
-	lock_span(tracer, span.id)
-	defer unlock_span(tracer, span.id)
+        sync.lock(&tracer.mu)
+        defer sync.unlock(&tracer.mu)
 
 	span := get_span(tracer, span.id)
 	span.ended = time.now()
 	set_span(tracer, span)
+
+}
+
+set_status :: proc(span: Span, status: Span_Status, tracer := global_tracer) {
+	if tracer == nil || span.id == {} || tracer.state != .Normal {
+		return
+	}
+
+        sync.lock(&tracer.mu)
+        defer sync.unlock(&tracer.mu)
+
+	span := get_span(tracer, span.id)
+        span.status = status
+        set_span(tracer, span)
 }
 
 set_attrs :: proc(span: Span, attrs: []Key_Attribute, tracer := global_tracer) {
-	if span.id == {} {
+	if tracer == nil || span.id == {} || tracer.state != .Normal {
 		return
 	}
 
@@ -144,14 +195,13 @@ set_attrs :: proc(span: Span, attrs: []Key_Attribute, tracer := global_tracer) {
 		return
 	}
 
-	lock_span(tracer, span.id)
-	defer unlock_span(tracer, span.id)
-	span := get_span(tracer, span.id)
+        sync.lock(&tracer.mu)
+        defer sync.unlock(&tracer.mu)
 
+	span := get_span(tracer, span.id)
 	if span.attrs == nil {
 		span.attrs = make([dynamic]Key_Attribute, 0, len(attrs), tracer.allocator)
 	}
-
 
 	new_attrs := span.attrs
 	for kv in attrs {
@@ -169,24 +219,11 @@ set_attrs :: proc(span: Span, attrs: []Key_Attribute, tracer := global_tracer) {
 }
 
 @(private)
-get_tracer :: proc() -> Tracer {
-	return global_tracer
+get_span :: proc(tracer: ^Tracer, id: uuid.Identifier) -> Span {
+        return tracer.spans[id]
 }
 
 @(private)
-lock_span :: proc(tracer: Tracer, id: uuid.Identifier) {
-}
-
-@(private)
-unlock_span :: proc(tracer: Tracer, id: uuid.Identifier) {
-}
-
-@(private)
-get_span :: proc(tracer: Tracer, id: uuid.Identifier) -> Span {
-	unimplemented()
-}
-
-@(private)
-set_span :: proc(tracer: Tracer, span: Span) {
-	unimplemented()
+set_span :: proc(tracer: ^Tracer, span: Span) {
+        tracer.spans[span.id] = span
 }
