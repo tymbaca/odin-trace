@@ -1,6 +1,7 @@
 #+vet explicit-allocators
 package trace
 
+import "core:crypto"
 import "core:thread"
 import "core:sync"
 import "base:runtime"
@@ -12,7 +13,7 @@ import "core:time"
 @(private)
 global_tracer: ^Tracer // noop by default
 
-init_tracer :: proc(
+init :: proc(
 	tracer: ^Tracer,
 	from_context_proc: proc(ctx: runtime.Context) -> (Span, bool),
 	to_context_proc: proc(ctx: runtime.Context, span: Span) -> runtime.Context,
@@ -34,7 +35,7 @@ init_tracer :: proc(
 	}
 }
 
-destroy_tracer :: proc(tracer: ^Tracer) {
+destroy :: proc(tracer: ^Tracer) {
         sync.lock(&tracer.mu)
         defer sync.unlock(&tracer.mu)
 
@@ -126,6 +127,8 @@ start :: proc(
 	if tracer == nil || tracer.state != .Normal {
 		return context, {}
 	}
+        context.allocator = tracer.allocator
+        context.random_generator = crypto.random_generator()
 
         sync.lock(&tracer.mu)
         defer sync.unlock(&tracer.mu)
@@ -171,6 +174,9 @@ end :: proc(span: Span, tracer := global_tracer) {
 	span.ended = time.now()
 	set_span(tracer, span)
 
+        append_to_export(tracer, span)
+
+        // TODO: cleanup
 }
 
 set_status :: proc(span: Span, status: Span_Status, tracer := global_tracer) {
