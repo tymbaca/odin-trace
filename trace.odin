@@ -64,7 +64,7 @@ Tracer :: struct {
         mu:                sync.Mutex,
 	spans:             map[uuid.Identifier]Span,
 	export_queue:      queue.Queue(Span),
-        export_queue_cond: sync.Auto_Reset_Event,
+        export_queue_sema: sync.Sema,
 
         state: Tracer_State,
 }
