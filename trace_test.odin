@@ -8,9 +8,15 @@ import "core:testing"
 
 @(test)
 tracer_test :: proc(t: ^testing.T) {
+        context.user_ptr = new(Context_User_Data, context.allocator)
+
         tracer: Tracer
         init(&tracer, from_context_proc, to_context_proc, context.allocator)
         defer destroy(&tracer)
+        defer {
+                data := (^Context_User_Data)(context.user_ptr)
+                free(data, tracer.allocator)
+        }
 
         set_global_tracer(&tracer)
 
@@ -40,10 +46,6 @@ Context_User_Data :: struct {
 
 to_context_proc :: proc(ctx: runtime.Context, span: Span) -> runtime.Context {
         ctx := ctx
-
-        if ctx.user_ptr == nil {
-                ctx.user_ptr = new(Context_User_Data, ctx.allocator)
-        }
 
         data := (^Context_User_Data)(ctx.user_ptr)
         data.current_span = span

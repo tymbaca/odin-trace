@@ -45,6 +45,10 @@ destroy :: proc(tracer: ^Tracer) {
 		stop_exporting(tracer)
 	}
 
+        for _, span in tracer.spans {
+                span_destroy(span)
+        }
+
         delete(tracer.spans)
         queue.destroy(&tracer.export_queue)
 
@@ -139,6 +143,7 @@ start :: proc(
 	}
 
 	new_span: Span
+        new_span.id = uuid.generate_v7()
 	new_span.started = time.now()
 	new_span.status = .Unset
 
@@ -177,6 +182,12 @@ end :: proc(span: Span, tracer := global_tracer) {
         append_to_export(tracer, span)
 
         // TODO: cleanup
+}
+
+span_destroy :: proc(span: Span) {
+        if span.attrs != nil {
+                delete(span.attrs)
+        }
 }
 
 set_status :: proc(span: Span, status: Span_Status, tracer := global_tracer) {
