@@ -26,6 +26,44 @@ tracer_test :: proc(t: ^testing.T) {
         testing.expect_value(t, queue.len(tracer.export_queue), 2)
 }
 
+@(test)
+tracer_exporter_test :: proc(t: ^testing.T) {
+        context.user_ptr = new(Context_User_Data, context.allocator)
+
+        exporter_impl: Test_Exporter
+        exporter := Exporter{
+                data = &exporter_impl,
+                export = test_exporter_proc,
+        }
+
+        tracer: Tracer
+        init(&tracer, from_context_proc, to_context_proc, context.allocator, exporter)
+        defer destroy(&tracer)
+        defer {
+                data := (^Context_User_Data)(context.user_ptr)
+                free(data, tracer.allocator)
+        }
+
+        set_global_tracer(&tracer)
+
+        foo()
+
+        testing.expect_value(t, len(tracer.spans), 0)
+        testing.expect_value(t, queue.len(tracer.export_queue), 0)
+
+        testing.expect_value(t, len(exporter_impl.spans), 2)
+}
+
+Test_Exporter :: struct {
+        spans: [dynamic]Span,
+}
+
+test_exporter_proc :: proc(data: rawptr, spans: []Span) -> Exporter_Error {
+        e := (^Test_Exporter)(data)
+        append(&e.spans, ..spans)
+        return nil
+}
+
 foo :: proc() {
 	span: Span
 	context, span = start() // foo

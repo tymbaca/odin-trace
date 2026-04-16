@@ -14,13 +14,16 @@ start_exporting :: proc(tracer: ^Tracer) {
 }
 
 stop_exporting :: proc(tracer: ^Tracer) {
-        sync.post(&tracer.export_queue_sema)
+        sync.broadcast(&tracer.export_queue_cond)
         thread.join(tracer.exporter_thread.?)
 }
 
 append_to_export :: proc(tracer: ^Tracer, span: Span) {
+        sync.lock(&tracer.export_queue_mu)
+        defer sync.unlock(&tracer.export_queue_mu)
+
         queue.push_back(&tracer.export_queue, span)
-        sync.post(&tracer.export_queue_sema)
+        sync.broadcast(&tracer.export_queue_cond)
 }
 
 listen_and_export :: proc(tracer: ^Tracer) {
@@ -38,6 +41,15 @@ listen_and_export :: proc(tracer: ^Tracer) {
                         for span in spans {
                                 queue.push_front(&tracer.export_queue, span)
                         }
+                        continue
+                }
+
+                sync.lock(&tracer.mu)
+                defer sync.lock(&tracer.mu)
+
+                for span in spans {
+                        delete_key(&tracer.spans, span.id)
+                        span_destroy(span)
                 }
         }
 }
@@ -45,9 +57,16 @@ listen_and_export :: proc(tracer: ^Tracer) {
 EXPORTER_WAIT_TIMEOUT :: 1 * time.Second
 
 wait_and_dequeue :: proc(tracer: ^Tracer, allocator: runtime.Allocator) -> (spans: []Span, must_exit: bool) {
-        sync.wait_with_timeout(&tracer.export_queue_sema, EXPORTER_WAIT_TIMEOUT)
+        sync.lock(&tracer.mu)
+        defer sync.lock(&tracer.mu)
+
+        sync.wait_with_timeout(&tracer.export_queue_cond, &tracer.export_queue_mu, EXPORTER_WAIT_TIMEOUT)
         if tracer.state != .Normal {
                 return nil, true
+        }
+
+        if queue.len(tracer.export_queue) == 0 {
+                return nil, false
         }
 
         spans_dyn := make([dynamic]Span, 0, queue.len(tracer.export_queue), allocator)
